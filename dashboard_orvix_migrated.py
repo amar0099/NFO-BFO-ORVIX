@@ -9,8 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import time
-import datetime as _dt
-from datetime import date
+from datetime import date, timedelta
 from plotly.subplots import make_subplots
 import numpy as np
 from scipy.stats import norm
@@ -126,10 +125,10 @@ def _exchange_segment(exchange, underlying=None):
 
 
 def _expiry_to_orvix(value):
-    """Normalize selected expiry to Orvix DDMMMYYYY contract format."""
+    """Normalize expiry to Orvix DDMMMYYYY. Month-only YYMMM is rejected because its exact expiry day cannot be inferred safely."""
     import re
     value = str(value).strip().upper()
-    for fmt in ("%d%b%Y", "%d-%b-%Y", "%d%b%y", "%y%b"):
+    for fmt in ("%d%b%Y", "%d-%b-%Y", "%d%b%y"):
         try:
             d = _dt.datetime.strptime(value, fmt).date()
             if d.year < 2000: d = d.replace(year=2000 + d.year)
@@ -138,9 +137,6 @@ def _expiry_to_orvix(value):
             pass
     if re.fullmatch(r"\d{6}", value):
         d = _dt.datetime.strptime(value, "%y%m%d").date()
-        return d.strftime("%d%b%Y").upper()
-    if re.fullmatch(r"\d{2}[A-Z]{3}", value):
-        d = _dt.datetime.strptime(value, "%y%b").date()
         return d.strftime("%d%b%Y").upper()
     raise ValueError(f"Unsupported expiry format: {value}. Expected DDMMMYYYY.")
 
@@ -162,178 +158,64 @@ def _save_expiry_cache(expiries):
     except Exception: pass
 
 
-
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def _fetch_expiries_from_instrument_master(api_base, api_key, token, segment, underlying):
-    """
-    Fallback for /expirydate returning ExpiryDate_NotFound.
-    Orvix documents /instruments as a daily consolidated CSV contract master.
-    Derive distinct option expiries from the actual listed contracts.
-    """
-    import io
-    import gzip
-
-    headers = {
-        "Api-Version": "4",
-        "Authorization": f"{api_key}:{token}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    response = requests.get(f"{api_base}/instruments", headers=headers, timeout=60)
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_orvix_expiries_cached(api_base, api_key, request_token, segment, underlying):
+    """Cache successful AND failed expiry lookups to prevent repeated blocking calls across tabs."""
+    headers = {"Api-Version": "4", "Authorization": f"{api_key}:{request_token}"}
+    response = requests.get(
+        f"{api_base}/expirydate",
+        headers=headers,
+        params={"symbol": underlying.upper(), "exchange": segment},
+        timeout=8,
+    )
     response.raise_for_status()
-    content = response.content
-
-    # Requests normally decompresses HTTP Content-Encoding automatically.
-    # The documentation describes a gzipped CSV payload, so also handle a
-    # gzip file body if the response itself is still compressed.
-    if content[:2] == b"\x1f\x8b":
-        content = gzip.decompress(content)
-
-    frame = pd.read_csv(io.BytesIO(content), dtype=str)
-    frame.columns = [str(c).strip().lower().replace(" ", "_") for c in frame.columns]
-
-    required = {"exchange", "symbol", "expiry_date", "option_type"}
-    missing = required.difference(frame.columns)
-    if missing:
-        raise RuntimeError(
-            f"Orvix /instruments CSV missing columns {sorted(missing)}; "
-            f"received columns: {list(frame.columns)}"
-        )
-
-    subset = frame[
-        frame["exchange"].fillna("").str.upper().eq(segment.upper())
-        & frame["symbol"].fillna("").str.upper().eq(underlying.upper())
-        & frame["option_type"].fillna("").str.upper().isin(["CE", "PE"])
-    ].copy()
-
-    if "instrument_type" in subset.columns:
-        # Exclude futures and cash instruments. Keep index-option and commodity
-        # option labels because Orvix's exact labels may differ by segment.
-        itype = subset["instrument_type"].fillna("").str.upper()
-        subset = subset[itype.str.contains("OPT")]
-
-    dates = set()
-    for raw in subset["expiry_date"].dropna().astype(str):
+    payload = response.json()
+    if isinstance(payload, dict) and payload.get("status") == "unsuccessful":
+        data = payload.get("data", {}) or {}
+        raise RuntimeError(data.get("Error") or data.get("error_text") or data.get("error") or str(payload))
+    data = payload.get("data", {}) or {}
+    raw = data.get("option_expiry", "")
+    dates = [x.strip().upper() for x in str(raw).split(",") if x.strip()]
+    result = {}
+    for exp in dates:
         try:
-            normalized = _expiry_to_orvix(raw)
-            expiry_date = _dt.datetime.strptime(normalized, "%d%b%Y").date()
-            if expiry_date >= date.today():
-                dates.add((expiry_date, normalized))
+            normalized = _expiry_to_orvix(exp)
+            d = _dt.datetime.strptime(normalized, "%d%b%Y").date()
+            if d >= date.today():
+                result[f"{d.strftime('%d %b %Y')} (Orvix)"] = normalized
         except Exception:
             continue
-
-    return {
-        d.strftime("%d %b %Y") + " (Master)": normalized
-        for d, normalized in sorted(dates)
-    }
+    return dict(sorted(result.items(), key=lambda kv: _dt.datetime.strptime(kv[1], "%d%b%Y")))
 
 
 def get_expiries_for(exchange, underlying):
-    """Fetch expiry dates from /expirydate; fall back to Orvix contract master."""
+    """Fetch Orvix expiry dates; selectbox values are DDMMMYYYY strings.
+
+    The Streamlit tab API executes every tab on each rerun. Cache failures briefly
+    too, otherwise a failed expiry endpoint is called repeatedly by every leg.
+    """
     segment = _exchange_segment(exchange, underlying)
     cache_key = f"{segment}:{underlying.upper()}"
     cached = _load_expiry_cache()
     if cached.get(cache_key):
         return cached[cache_key]
-
-    client = get_orvix_client()
-    if client is None:
-        return {}
-
-    expiry_url = f"{ORVIX_API_BASE}/expirydate"
-    params = {"symbol": underlying.upper(), "exchange": segment}
-
     try:
-        # Documentation explicitly specifies GET /expirydate.
-        response = client.session.get(
-            expiry_url,
-            headers={
-                **client.headers,
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            params=params,
-            timeout=25,
+        token, error = get_shared_token()
+        if not token:
+            st.warning(f"Orvix expiry lookup skipped for {underlying}: {error}")
+            return {}
+        result = _fetch_orvix_expiries_cached(
+            ORVIX_API_BASE, get_secret("ORVIX_API_KEY"), token, segment, underlying.upper()
         )
-        response.raise_for_status()
-        payload = response.json()
-
-        if isinstance(payload, dict) and str(payload.get("status", "")).lower() == "unsuccessful":
-            data = payload.get("data", {}) or {}
-            # API's observed response uses capitalized "Error".
-            api_error = (
-                data.get("error_text") or data.get("error")
-                or data.get("Error") or str(data)
-            )
-            if str(api_error).lower() == "expirydate_notfound":
-                raise LookupError("ExpiryDate_NotFound")
-            raise RuntimeError(f"Orvix /expirydate returned: {api_error}")
-
-        data = payload.get("data", {}) or {}
-        raw = data.get("option_expiry", "")
-        dates = [x.strip().upper() for x in str(raw).split(",") if x.strip()]
-        result = {}
-        for exp in dates:
-            try:
-                normalized = _expiry_to_orvix(exp)
-                d = _dt.datetime.strptime(normalized, "%d%b%Y").date()
-                if d >= date.today():
-                    result[f"{d.strftime('%d %b %Y')} (Orvix)"] = normalized
-            except Exception:
-                continue
-
-        if not result:
-            raise LookupError("ExpiryDate_NotFound or empty option_expiry")
-
-    except LookupError as e:
-        try:
-            result = _fetch_expiries_from_instrument_master(
-                ORVIX_API_BASE, client.api_key, client.request_token, segment, underlying
-            )
-        except Exception as master_error:
-            st.warning(
-                f"Orvix expiry lookup failed for {underlying} ({segment}). "
-                f"/expirydate returned {e}; /instruments fallback failed: {master_error}"
-            )
-            return {}
-        if not result:
-            st.warning(
-                f"Orvix has no listed CE/PE contracts for {underlying} ({segment}) "
-                "in its current instrument master."
-            )
-            return {}
-
-    except requests.HTTPError as e:
-        # Some Orvix deployments currently return HTTP 405 for the documented
-        # GET /expirydate endpoint. Do not retry it with POST: the API docs
-        # specify GET. Derive expiries from the contract master instead.
-        status_code = getattr(getattr(e, "response", None), "status_code", None)
-        if status_code == 405:
-            try:
-                result = _fetch_expiries_from_instrument_master(
-                    ORVIX_API_BASE, client.api_key, client.request_token, segment, underlying
-                )
-            except Exception as master_error:
-                st.warning(
-                    f"Orvix /expirydate returned HTTP 405 for {underlying} ({segment}); "
-                    f"/instruments fallback failed: {master_error}"
-                )
-                return {}
-            if not result:
-                st.warning(
-                    f"Orvix /expirydate returned HTTP 405 and the current /instruments "
-                    f"master contains no matching CE/PE contracts for {underlying} ({segment})."
-                )
-                return {}
+        if result:
+            cached[cache_key] = result
+            _save_expiry_cache(cached)
         else:
-            st.warning(f"Orvix expiry lookup failed for {underlying} ({segment}): {e}")
-            return {}
-
+            st.warning(f"Orvix returned no option expiries for {underlying} ({segment}).")
+        return result
     except Exception as e:
         st.warning(f"Orvix expiry lookup failed for {underlying} ({segment}): {e}")
         return {}
-
-    cached[cache_key] = result
-    _save_expiry_cache(cached)
-    return result
 
 
 def expiry_selectbox(label, opts_dict, manual_key, select_key, default_manual):
@@ -365,7 +247,7 @@ def _resolve_orvix_instrument(api_base, api_key, token, segment, symbol, expiry,
     headers = {"Api-Version": "4", "Authorization": f"{api_key}:{token}"}
     params = {"symbol": symbol, "expiry_date": expiry, "strike_price": str(strike),
               "option_type": option_type, "exchange": segment, "instrument_type": instrument_type}
-    r = requests.get(f"{api_base}/instrumentid", headers=headers, params=params, timeout=20)
+    r = requests.get(f"{api_base}/instrumentid", headers=headers, params=params, timeout=8)
     r.raise_for_status()
     payload = r.json()
     data = payload.get("data", {})
@@ -379,7 +261,7 @@ def _resolve_orvix_instrument(api_base, api_key, token, segment, symbol, expiry,
 def _resolve_orvix_index(api_base, api_key, token, segment, symbol):
     headers = {"Api-Version": "4", "Authorization": f"{api_key}:{token}"}
     params = {"symbol": symbol, "exchange": segment, "instrument_type": "INDEX"}
-    r = requests.get(f"{api_base}/instrumentid", headers=headers, params=params, timeout=20)
+    r = requests.get(f"{api_base}/instrumentid", headers=headers, params=params, timeout=8)
     r.raise_for_status()
     payload = r.json(); data = payload.get("data", {})
     iid = data.get("instrument_id") or data.get("security_id")
@@ -756,6 +638,7 @@ else:
 
 
 
+import datetime as _dt
 _now = _dt.datetime.now().strftime("%H:%M:%S")
 
 
@@ -791,7 +674,7 @@ st.markdown(f"""
         </div>
     </div>
     <div class="nav-pills">
-        <span class="nav-pill pill-live">● LIVE</span>
+        <span class="nav-pill pill-live">● ORVIX REST</span>
         <span class="nav-pill pill-time">{_now} IST</span>
     </div>
 </div>
@@ -909,7 +792,7 @@ with tab2:
         days_ahead = weekday - d.weekday()
         if days_ahead <= 0:
             days_ahead += 7
-        return (d + pd.Timedelta(days=days_ahead)).strftime("%y%m%d")
+        return (d + timedelta(days=days_ahead)).strftime("%y%m%d")
 
     nse_exp = next_weekday_str(1)  # Tuesday
     bse_exp = next_weekday_str(3)  # Thursday
@@ -1116,7 +999,7 @@ with tab4:
         days_ahead = weekday - d.weekday()
         if days_ahead <= 0:
             days_ahead += 7
-        return (d + pd.Timedelta(days=days_ahead)).strftime("%y%m%d")
+        return (d + timedelta(days=days_ahead)).strftime("%y%m%d")
 
     nse_exp = next_weekday_str(1)  # Tuesday
     bse_exp = next_weekday_str(3)  # Thursday
