@@ -161,11 +161,12 @@ def _save_expiry_cache(expiries):
 @st.cache_data(ttl=300, show_spinner=False)
 def _fetch_orvix_expiries_cached(api_base, api_key, request_token, segment, underlying):
     """Cache successful AND failed expiry lookups to prevent repeated blocking calls across tabs."""
-    headers = {"Api-Version": "4", "Authorization": f"{api_key}:{request_token}"}
+    headers = {"Api-Version": "4", "Content-Type": "application/x-www-form-urlencoded",
+               "Authorization": f"{api_key}:{request_token}"}
     response = requests.get(
         f"{api_base}/expirydate",
         headers=headers,
-        params={"symbol": underlying.upper(), "exchange": segment},
+        data={"symbol": underlying.upper(), "exchange": segment},
         timeout=8,
     )
     response.raise_for_status()
@@ -244,10 +245,11 @@ def _build_spot_key(symbol):
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _resolve_orvix_instrument(api_base, api_key, token, segment, symbol, expiry, strike, option_type, instrument_type):
-    headers = {"Api-Version": "4", "Authorization": f"{api_key}:{token}"}
+    headers = {"Api-Version": "4", "Content-Type": "application/x-www-form-urlencoded",
+               "Authorization": f"{api_key}:{token}"}
     params = {"symbol": symbol, "expiry_date": expiry, "strike_price": str(strike),
               "option_type": option_type, "exchange": segment, "instrument_type": instrument_type}
-    r = requests.get(f"{api_base}/instrumentid", headers=headers, params=params, timeout=8)
+    r = requests.get(f"{api_base}/instrumentid", headers=headers, data=params, timeout=8)
     r.raise_for_status()
     payload = r.json()
     data = payload.get("data", {})
@@ -259,9 +261,10 @@ def _resolve_orvix_instrument(api_base, api_key, token, segment, symbol, expiry,
 
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def _resolve_orvix_index(api_base, api_key, token, segment, symbol):
-    headers = {"Api-Version": "4", "Authorization": f"{api_key}:{token}"}
+    headers = {"Api-Version": "4", "Content-Type": "application/x-www-form-urlencoded",
+               "Authorization": f"{api_key}:{token}"}
     params = {"symbol": symbol, "exchange": segment, "instrument_type": "INDEX"}
-    r = requests.get(f"{api_base}/instrumentid", headers=headers, params=params, timeout=8)
+    r = requests.get(f"{api_base}/instrumentid", headers=headers, data=params, timeout=8)
     r.raise_for_status()
     payload = r.json(); data = payload.get("data", {})
     iid = data.get("instrument_id") or data.get("security_id")
@@ -274,15 +277,15 @@ def _resolve_symbol(client, symbol):
     parts = str(symbol).split("|")
     if len(parts) >= 7 and parts[0] == "ORVIX" and parts[1] == "OPT":
         _, _, segment, underlying, expiry, strike, opt_type = parts[:7]
-        instrument_type = "OPT" if segment == "MCX" else "OPTIDX"
+        instrument_type = "OPT"
         try:
             iid = _resolve_orvix_instrument(ORVIX_API_BASE, client.api_key, client.request_token,
                                             segment, underlying, expiry, strike, opt_type, instrument_type)
         except Exception:
-            # Orvix documentation also lists generic OPT for index options; retry its alternate label.
-            if instrument_type == "OPTIDX":
+            # Some Orvix deployments label index options as OPTIDX; retry only after OPT fails.
+            if instrument_type == "OPT":
                 iid = _resolve_orvix_instrument(ORVIX_API_BASE, client.api_key, client.request_token,
-                                                segment, underlying, expiry, strike, opt_type, "OPT")
+                                                segment, underlying, expiry, strike, opt_type, "OPTIDX")
             else:
                 raise
         return segment, iid
