@@ -301,6 +301,32 @@ def get_expiries_for(exchange, underlying):
             )
             return {}
 
+    except requests.HTTPError as e:
+        # Some Orvix deployments currently return HTTP 405 for the documented
+        # GET /expirydate endpoint. Do not retry it with POST: the API docs
+        # specify GET. Derive expiries from the contract master instead.
+        status_code = getattr(getattr(e, "response", None), "status_code", None)
+        if status_code == 405:
+            try:
+                result = _fetch_expiries_from_instrument_master(
+                    ORVIX_API_BASE, client.api_key, client.request_token, segment, underlying
+                )
+            except Exception as master_error:
+                st.warning(
+                    f"Orvix /expirydate returned HTTP 405 for {underlying} ({segment}); "
+                    f"/instruments fallback failed: {master_error}"
+                )
+                return {}
+            if not result:
+                st.warning(
+                    f"Orvix /expirydate returned HTTP 405 and the current /instruments "
+                    f"master contains no matching CE/PE contracts for {underlying} ({segment})."
+                )
+                return {}
+        else:
+            st.warning(f"Orvix expiry lookup failed for {underlying} ({segment}): {e}")
+            return {}
+
     except Exception as e:
         st.warning(f"Orvix expiry lookup failed for {underlying} ({segment}): {e}")
         return {}
